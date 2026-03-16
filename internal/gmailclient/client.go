@@ -153,7 +153,21 @@ func authorizedHTTPClient(ctx context.Context, cfg *oauth2.Config, store *state.
 		}
 	}
 
-	return cfg.Client(ctx, token), nil
+	token, err = refreshAccessToken(ctx, cfg, token)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveToken(ctx, store, token); err != nil {
+		return nil, err
+	}
+
+	source := &persistentTokenSource{
+		base:  cfg.TokenSource(ctx, token),
+		store: store,
+		ctx:   ctx,
+	}
+
+	return oauth2.NewClient(ctx, source), nil
 }
 
 func getTokenFromWeb(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, error) {
@@ -272,6 +286,51 @@ func saveToken(ctx context.Context, store *state.Store, token *oauth2.Token) err
 		return err
 	}
 	return nil
+}
+
+func refreshAccessToken(ctx context.Context, cfg *oauth2.Config, token *oauth2.Token) (*oauth2.Token, error) {
+	if token == nil {
+		return nil, errors.New("oauth token is nil")
+	}
+	if token.RefreshToken == "" {
+		return token, nil
+	}
+
+	fresh, err := cfg.TokenSource(ctx, &oauth2.Token{
+		RefreshToken: token.RefreshToken,
+		TokenType:    token.TokenType,
+	}).Token()
+	if err != nil {
+		return nil, fmt.Errorf("refresh access token: %w", err)
+	}
+	if fresh.RefreshToken == "" {
+		fresh.RefreshToken = token.RefreshToken
+	}
+
+	return fresh, nil
+}
+
+type persistentTokenSource struct {
+	base  oauth2.TokenSource
+	store *state.Store
+	ctx   context.Context
+}
+
+func (s *persistentTokenSource) Token() (*oauth2.Token, error) {
+	token, err := s.base.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token.RefreshToken == "" {
+		stored, readErr := readToken(s.ctx, s.store)
+		if readErr == nil && stored.RefreshToken != "" {
+			token.RefreshToken = stored.RefreshToken
+		}
+	}
+	if err := saveToken(s.ctx, s.store, token); err != nil {
+		return nil, err
+	}
+	return token, nil
 }
 
 func (c *Client) ensureLabel(ctx context.Context, name string) error {
