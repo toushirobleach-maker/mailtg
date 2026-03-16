@@ -1,0 +1,6 @@
+.git
+.env
+mailtg
+mailtg.db
+token.json
+credentials.json
