@@ -44,13 +44,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("snapshot startup unread messages: %v", err)
 	}
+	loggedIgnoredAtStartup := make(map[string]struct{}, len(ignoredAtStartup))
 
 	log.Printf("mailtg started, polling every %s, ignoring %d unread messages present at startup", cfg.PollInterval, len(ignoredAtStartup))
 
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 
-	if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup); err != nil {
+	if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup, loggedIgnoredAtStartup); err != nil {
 		log.Printf("initial poll failed: %v", err)
 	}
 
@@ -60,7 +61,7 @@ func main() {
 			log.Println("shutting down")
 			return
 		case <-ticker.C:
-			if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup); err != nil && !errors.Is(err, context.Canceled) {
+			if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup, loggedIgnoredAtStartup); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("poll failed: %v", err)
 			}
 		}
@@ -73,6 +74,7 @@ func processOnce(
 	sender *tgsender.Sender,
 	store *state.Store,
 	ignoredAtStartup map[string]struct{},
+	loggedIgnoredAtStartup map[string]struct{},
 ) error {
 	messages, err := mailSvc.ListUnread(ctx)
 	if err != nil {
@@ -87,7 +89,10 @@ func processOnce(
 		}
 
 		if _, ignored := ignoredAtStartup[msg.ID]; ignored {
-			log.Printf("mail message %s skipped: status=ignored_at_startup", msg.ID)
+			if _, logged := loggedIgnoredAtStartup[msg.ID]; !logged {
+				log.Printf("mail message %s skipped: status=ignored_at_startup", msg.ID)
+				loggedIgnoredAtStartup[msg.ID] = struct{}{}
+			}
 			continue
 		}
 
