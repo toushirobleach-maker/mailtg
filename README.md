@@ -13,7 +13,7 @@ Use the mailbox plus address to encode the Telegram destination:
 
 ## What it does
 
-- polls an IMAP inbox for unread messages
+- polls all IMAP folders for unread messages, including Spam/Junk if exposed by the server
 - reads the recipient address from `Delivered-To`, fallback to `X-Original-To`, then `To`
 - sends the full mail text to Telegram
 - if the email contains one image, sends that image and uses the mail text as the caption

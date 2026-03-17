@@ -15,7 +15,6 @@ const (
 	defaultDBPath       = "mailtg.db"
 	defaultIMAPHost     = "imap.yandex.ru"
 	defaultIMAPPort     = 993
-	defaultIMAPMailbox  = "INBOX"
 )
 
 type Config struct {
@@ -26,7 +25,6 @@ type Config struct {
 	IMAPPort     int
 	IMAPUsername string
 	IMAPPassword string
-	IMAPMailbox  string
 }
 
 func Load() (*Config, error) {
@@ -40,7 +38,6 @@ func Load() (*Config, error) {
 		IMAPPort:     defaultIMAPPort,
 		IMAPUsername: os.Getenv("IMAP_USERNAME"),
 		IMAPPassword: os.Getenv("IMAP_PASSWORD"),
-		IMAPMailbox:  getEnv("IMAP_MAILBOX", defaultIMAPMailbox),
 	}
 
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {

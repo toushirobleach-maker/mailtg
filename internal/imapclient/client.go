@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"mailtg/internal/config"
@@ -24,7 +25,8 @@ type Client struct {
 }
 
 type MessageRef struct {
-	ID string
+	ID      string
+	Mailbox string
 }
 
 func New(cfg *config.Config) *Client {
@@ -42,23 +44,30 @@ func (c *Client) ListUnread(ctx context.Context) ([]MessageRef, error) {
 	}
 	defer conn.Logout()
 
-	criteria := imap.NewSearchCriteria()
-	criteria.WithoutFlags = []string{imap.SeenFlag}
-
-	uids, err := conn.UidSearch(criteria)
+	mailboxes, err := c.listMailboxes(ctx, conn)
 	if err != nil {
-		return nil, fmt.Errorf("search unread messages: %w", err)
+		return nil, err
 	}
 
-	refs := make([]MessageRef, 0, len(uids))
-	for _, uid := range uids {
-		refs = append(refs, MessageRef{ID: uidToID(uid)})
+	refs := make([]MessageRef, 0)
+	for _, mailbox := range mailboxes {
+		uids, err := c.searchUnreadInMailbox(ctx, conn, mailbox)
+		if err != nil {
+			return nil, err
+		}
+		for _, uid := range uids {
+			refs = append(refs, MessageRef{
+				ID:      composeMessageID(mailbox, uid),
+				Mailbox: mailbox,
+			})
+		}
 	}
+
 	return refs, nil
 }
 
 func (c *Client) GetParsedMessage(ctx context.Context, id string) (*mailparse.ParsedMessage, error) {
-	uid, err := idToUID(id)
+	mailbox, uid, err := parseMessageID(id)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +77,10 @@ func (c *Client) GetParsedMessage(ctx context.Context, id string) (*mailparse.Pa
 		return nil, err
 	}
 	defer conn.Logout()
+
+	if err := c.selectMailbox(ctx, conn, mailbox); err != nil {
+		return nil, err
+	}
 
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uid)
@@ -129,28 +142,73 @@ func (c *Client) connect(ctx context.Context) (*client.Client, error) {
 		return nil, fmt.Errorf("imap login: %w", err)
 	}
 
+	return conn, nil
+}
+
+func (c *Client) listMailboxes(ctx context.Context, conn *client.Client) ([]string, error) {
+	mailboxesCh := make(chan *imap.MailboxInfo, 100)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- conn.List("", "*", mailboxesCh)
+	}()
+
+	var mailboxes []string
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case mailbox, ok := <-mailboxesCh:
+			if !ok {
+				if err := <-errCh; err != nil {
+					return nil, fmt.Errorf("list mailboxes: %w", err)
+				}
+				return mailboxes, nil
+			}
+			if mailbox == nil || hasNoSelect(mailbox.Attributes) {
+				continue
+			}
+			mailboxes = append(mailboxes, mailbox.Name)
+		}
+	}
+}
+
+func (c *Client) searchUnreadInMailbox(ctx context.Context, conn *client.Client, mailbox string) ([]uint32, error) {
+	if err := c.selectMailbox(ctx, conn, mailbox); err != nil {
+		return nil, err
+	}
+
+	criteria := imap.NewSearchCriteria()
+	criteria.WithoutFlags = []string{imap.SeenFlag}
+
+	uids, err := conn.UidSearch(criteria)
+	if err != nil {
+		return nil, fmt.Errorf("search unread messages in %s: %w", mailbox, err)
+	}
+
+	return uids, nil
+}
+
+func (c *Client) selectMailbox(ctx context.Context, conn *client.Client, mailbox string) error {
 	done := make(chan error, 1)
 	go func() {
-		_, selectErr := conn.Select(c.config.IMAPMailbox, false)
-		done <- selectErr
+		_, err := conn.Select(mailbox, false)
+		done <- err
 	}()
 
 	select {
 	case <-ctx.Done():
-		conn.Logout()
-		return nil, ctx.Err()
+		return ctx.Err()
 	case err := <-done:
 		if err != nil {
-			conn.Logout()
-			return nil, fmt.Errorf("select mailbox %s: %w", c.config.IMAPMailbox, err)
+			return fmt.Errorf("select mailbox %s: %w", mailbox, err)
 		}
+		return nil
 	}
-
-	return conn, nil
 }
 
 func (c *Client) updateFlags(ctx context.Context, id string, item imap.StoreItem, flags []interface{}) error {
-	uid, err := idToUID(id)
+	mailbox, uid, err := parseMessageID(id)
 	if err != nil {
 		return err
 	}
@@ -160,6 +218,10 @@ func (c *Client) updateFlags(ctx context.Context, id string, item imap.StoreItem
 		return err
 	}
 	defer conn.Logout()
+
+	if err := c.selectMailbox(ctx, conn, mailbox); err != nil {
+		return err
+	}
 
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uid)
@@ -180,14 +242,29 @@ func (c *Client) updateFlags(ctx context.Context, id string, item imap.StoreItem
 	}
 }
 
-func uidToID(uid uint32) string {
-	return strconv.FormatUint(uint64(uid), 10)
+func hasNoSelect(attrs []string) bool {
+	for _, attr := range attrs {
+		if strings.EqualFold(attr, imap.NoSelectAttr) {
+			return true
+		}
+	}
+	return false
 }
 
-func idToUID(id string) (uint32, error) {
-	value, err := strconv.ParseUint(id, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid imap uid %q: %w", id, err)
+func composeMessageID(mailbox string, uid uint32) string {
+	return mailbox + "::" + strconv.FormatUint(uint64(uid), 10)
+}
+
+func parseMessageID(id string) (string, uint32, error) {
+	mailbox, uidRaw, ok := strings.Cut(id, "::")
+	if !ok || mailbox == "" || uidRaw == "" {
+		return "", 0, fmt.Errorf("invalid imap message id %q", id)
 	}
-	return uint32(value), nil
+
+	value, err := strconv.ParseUint(uidRaw, 10, 32)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid imap uid %q: %w", id, err)
+	}
+
+	return mailbox, uint32(value), nil
 }
