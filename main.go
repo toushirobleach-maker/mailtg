@@ -87,10 +87,12 @@ func processOnce(
 		}
 
 		if _, ignored := ignoredAtStartup[msg.ID]; ignored {
+			log.Printf("mail message %s skipped: status=ignored_at_startup", msg.ID)
 			continue
 		}
 
 		if store.IsFailed(ctx, msg.ID, maxFailures) {
+			log.Printf("mail message %s skipped: status=failed_permanently", msg.ID)
 			if err := mailSvc.MarkFailed(ctx, msg.ID); err != nil {
 				log.Printf("mark previously failed message %s: %v", msg.ID, err)
 			}
@@ -98,6 +100,7 @@ func processOnce(
 		}
 
 		if store.IsProcessed(ctx, msg.ID) {
+			log.Printf("mail message %s skipped: status=already_processed", msg.ID)
 			if err := mailSvc.MarkRead(ctx, msg.ID); err != nil {
 				log.Printf("mark read skipped message %s: %v", msg.ID, err)
 			}
@@ -110,26 +113,48 @@ func processOnce(
 			continue
 		}
 		log.Printf(
-			"received mail message %s to %s -> chat_id=%d thread_id=%d has_photo=%t text=%q",
+			"mail message %s received: to=%s chat_id=%d thread_id=%d has_photo=%t has_button=%t text=%q",
 			msg.ID,
 			parsed.Recipient,
 			parsed.ChatID,
 			parsed.ThreadID,
 			parsed.Photo != nil,
+			parsed.URL != "",
 			singleLine(parsed.Text),
+		)
+		log.Printf(
+			"telegram delivery pending for mail message %s: chat_id=%d thread_id=%d has_photo=%t has_button=%t",
+			msg.ID,
+			parsed.ChatID,
+			parsed.ThreadID,
+			parsed.Photo != nil,
+			parsed.URL != "",
 		)
 
 		result, err := sender.Deliver(parsed)
 		if err != nil {
+			log.Printf(
+				"telegram delivery failed for mail message %s: chat_id=%d thread_id=%d has_photo=%t has_button=%t error=%q text=%q",
+				msg.ID,
+				parsed.ChatID,
+				parsed.ThreadID,
+				parsed.Photo != nil,
+				parsed.URL != "",
+				err.Error(),
+				singleLine(parsed.Text),
+			)
 			recordFailure(ctx, mailSvc, store, msg.ID, err)
 			continue
 		}
 		log.Printf(
-			"telegram delivery ok for mail message %s: mode=%s chat_id=%d thread_id=%d",
+			"telegram delivery ok for mail message %s: mode=%s chat_id=%d thread_id=%d has_photo=%t has_button=%t text=%q",
 			msg.ID,
 			result.Mode,
 			parsed.ChatID,
 			parsed.ThreadID,
+			parsed.Photo != nil,
+			parsed.URL != "",
+			singleLine(parsed.Text),
 		)
 
 		if err := store.ClearFailure(ctx, msg.ID); err != nil {
