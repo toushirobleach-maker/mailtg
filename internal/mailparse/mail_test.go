@@ -14,18 +14,18 @@ func TestParseAddressTarget(t *testing.T) {
 	}{
 		{
 			name:      "chat and thread",
-			address:   "test+-1001234567890+23@gmail.com",
+			address:   "test+-1001234567890+23@yandex.ru",
 			wantChat:  -1001234567890,
 			wantTopic: 23,
 		},
 		{
 			name:     "chat only",
-			address:  "test+-1001234567890@gmail.com",
+			address:  "test+-1001234567890@yandex.ru",
 			wantChat: -1001234567890,
 		},
 		{
 			name:    "missing suffix",
-			address: "test@gmail.com",
+			address: "test@yandex.ru",
 			wantErr: true,
 		},
 	}

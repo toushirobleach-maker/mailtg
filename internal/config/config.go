@@ -13,26 +13,34 @@ import (
 const (
 	defaultPollInterval = 15 * time.Second
 	defaultDBPath       = "mailtg.db"
-	defaultQuery        = "is:unread in:inbox"
+	defaultIMAPHost     = "imap.yandex.ru"
+	defaultIMAPPort     = 993
+	defaultIMAPMailbox  = "INBOX"
 )
 
 type Config struct {
-	BotToken             string
-	GmailCredentialsPath string
-	PollInterval         time.Duration
-	DBPath               string
-	GmailQuery           string
+	BotToken     string
+	PollInterval time.Duration
+	DBPath       string
+	IMAPHost     string
+	IMAPPort     int
+	IMAPUsername string
+	IMAPPassword string
+	IMAPMailbox  string
 }
 
 func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		BotToken:             os.Getenv("BOT_TOKEN"),
-		GmailCredentialsPath: os.Getenv("GMAIL_CREDENTIALS_PATH"),
-		PollInterval:         defaultPollInterval,
-		DBPath:               getEnv("DB_PATH", defaultDBPath),
-		GmailQuery:           getEnv("GMAIL_QUERY", defaultQuery),
+		BotToken:     os.Getenv("BOT_TOKEN"),
+		PollInterval: defaultPollInterval,
+		DBPath:       getEnv("DB_PATH", defaultDBPath),
+		IMAPHost:     getEnv("IMAP_HOST", defaultIMAPHost),
+		IMAPPort:     defaultIMAPPort,
+		IMAPUsername: os.Getenv("IMAP_USERNAME"),
+		IMAPPassword: os.Getenv("IMAP_PASSWORD"),
+		IMAPMailbox:  getEnv("IMAP_MAILBOX", defaultIMAPMailbox),
 	}
 
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
@@ -42,12 +50,21 @@ func Load() (*Config, error) {
 		}
 		cfg.PollInterval = time.Duration(seconds) * time.Second
 	}
+	if raw := os.Getenv("IMAP_PORT"); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port <= 0 {
+			return nil, fmt.Errorf("invalid IMAP_PORT: %q", raw)
+		}
+		cfg.IMAPPort = port
+	}
 
 	switch {
 	case cfg.BotToken == "":
 		return nil, errors.New("BOT_TOKEN is required")
-	case cfg.GmailCredentialsPath == "":
-		return nil, errors.New("GMAIL_CREDENTIALS_PATH is required")
+	case cfg.IMAPUsername == "":
+		return nil, errors.New("IMAP_USERNAME is required")
+	case cfg.IMAPPassword == "":
+		return nil, errors.New("IMAP_PASSWORD is required")
 	}
 
 	return cfg, nil

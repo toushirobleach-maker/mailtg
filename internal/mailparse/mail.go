@@ -1,9 +1,9 @@
 package mailparse
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/url"
 	"path/filepath"
@@ -12,15 +12,17 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/charset"
+	mail "github.com/emersion/go-message/mail"
 	"golang.org/x/net/html"
-	gmail "google.golang.org/api/gmail/v1"
 )
 
 var tagStripper = regexp.MustCompile(`\+(-?\d+)(?:\+(\d+))?$`)
 var firstURLPattern = regexp.MustCompile(`https?://[^\s<>()]+`)
 
 type ParsedMessage struct {
-	GmailID   string
+	MessageID string
 	Recipient string
 	ChatID    int64
 	ThreadID  int64
@@ -35,14 +37,15 @@ type Photo struct {
 	Data     []byte
 }
 
-type AttachmentFetcher func(messageID, attachmentID string) ([]byte, error)
+func ParseRaw(messageID string, raw io.Reader) (*ParsedMessage, error) {
+	message.CharsetReader = charset.Reader
 
-func Parse(message *gmail.Message, fetch AttachmentFetcher) (*ParsedMessage, error) {
-	if message == nil || message.Payload == nil {
-		return nil, errors.New("empty message payload")
+	msg, err := mail.CreateReader(raw)
+	if err != nil {
+		return nil, fmt.Errorf("read raw message: %w", err)
 	}
 
-	recipient, err := findRecipient(message.Payload.Headers)
+	recipient, err := findRecipient(&msg.Header)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +55,7 @@ func Parse(message *gmail.Message, fetch AttachmentFetcher) (*ParsedMessage, err
 		return nil, err
 	}
 
-	text, photo, err := walkPart(message.Id, message.Payload, fetch)
+	text, photo, err := extractContent(msg)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +72,7 @@ func Parse(message *gmail.Message, fetch AttachmentFetcher) (*ParsedMessage, err
 	}
 
 	return &ParsedMessage{
-		GmailID:   message.Id,
+		MessageID: messageID,
 		Recipient: recipient,
 		ChatID:    chatID,
 		ThreadID:  threadID,
@@ -87,14 +90,16 @@ func (p *ParsedMessage) ThreadIDString() string {
 	return strconv.FormatInt(p.ThreadID, 10)
 }
 
-func findRecipient(headers []*gmail.MessagePartHeader) (string, error) {
+type headerGetter interface {
+	Get(string) string
+}
+
+func findRecipient(headers headerGetter) (string, error) {
 	for _, key := range []string{"Delivered-To", "X-Original-To", "To"} {
-		for _, header := range headers {
-			if strings.EqualFold(header.Name, key) && header.Value != "" {
-				addresses, err := mailAddressList(header.Value)
-				if err == nil && len(addresses) > 0 {
-					return addresses[0], nil
-				}
+		if value := headers.Get(key); value != "" {
+			addresses, err := mailAddressList(value)
+			if err == nil && len(addresses) > 0 {
+				return addresses[0], nil
 			}
 		}
 	}
@@ -129,49 +134,57 @@ func parseAddressTarget(address string) (int64, int64, error) {
 	return chatID, threadID, nil
 }
 
-func walkPart(messageID string, part *gmail.MessagePart, fetch AttachmentFetcher) (string, *Photo, error) {
+func extractContent(reader *mail.Reader) (string, *Photo, error) {
 	var plainText string
 	var htmlText string
 	var photo *Photo
 
-	var visit func(current *gmail.MessagePart) error
-	visit = func(current *gmail.MessagePart) error {
-		if current == nil {
-			return nil
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-
-		if len(current.Parts) > 0 {
-			for _, child := range current.Parts {
-				if err := visit(child); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
-		data, err := readBody(messageID, current, fetch)
 		if err != nil {
-			return err
-		}
-
-		switch {
-		case current.MimeType == "text/plain" && plainText == "":
-			plainText = strings.TrimSpace(string(data))
-		case current.MimeType == "text/html" && htmlText == "":
-			htmlText = strings.TrimSpace(htmlToText(string(data)))
-		case strings.HasPrefix(current.MimeType, "image/") && photo == nil:
-			photo = &Photo{
-				Filename: filenameOrDefault(current.Filename, current.MimeType),
-				MIMEType: current.MimeType,
-				Data:     data,
+			if !message.IsUnknownCharset(err) {
+				return "", nil, fmt.Errorf("read message part: %w", err)
 			}
 		}
+		if part == nil {
+			continue
+		}
 
-		return nil
-	}
+		data, err := io.ReadAll(part.Body)
+		if err != nil {
+			return "", nil, fmt.Errorf("read part body: %w", err)
+		}
 
-	if err := visit(part); err != nil {
-		return "", nil, err
+		switch header := part.Header.(type) {
+		case *mail.InlineHeader:
+			mediaType, _, _ := header.ContentType()
+			text, partPhoto, err := pickSinglePart(mediaType, header.Get("Content-Disposition"), "", "", data)
+			if err != nil {
+				return "", nil, err
+			}
+			if plainText == "" && text != "" && mediaType == "text/plain" {
+				plainText = text
+			}
+			if htmlText == "" && text != "" && mediaType == "text/html" {
+				htmlText = text
+			}
+			if photo == nil && partPhoto != nil {
+				photo = partPhoto
+			}
+		case *mail.AttachmentHeader:
+			filename, _ := header.Filename()
+			mediaType, _, _ := header.ContentType()
+			_, partPhoto, err := pickSinglePart(mediaType, header.Get("Content-Disposition"), "", filename, data)
+			if err != nil {
+				return "", nil, err
+			}
+			if photo == nil && partPhoto != nil {
+				photo = partPhoto
+			}
+		}
 	}
 
 	if plainText != "" {
@@ -181,23 +194,22 @@ func walkPart(messageID string, part *gmail.MessagePart, fetch AttachmentFetcher
 	return htmlText, photo, nil
 }
 
-func readBody(messageID string, part *gmail.MessagePart, fetch AttachmentFetcher) ([]byte, error) {
-	if part.Body == nil {
-		return nil, nil
+func pickSinglePart(mediaType, disposition, _ string, fileName string, data []byte) (string, *Photo, error) {
+	switch {
+	case mediaType == "text/plain":
+		return strings.TrimSpace(string(data)), nil, nil
+	case mediaType == "text/html":
+		return strings.TrimSpace(htmlToText(string(data))), nil, nil
+	case strings.HasPrefix(mediaType, "image/"):
+		if strings.HasPrefix(strings.ToLower(disposition), "attachment") || strings.HasPrefix(strings.ToLower(disposition), "inline") || disposition == "" {
+			return "", &Photo{
+				Filename: filenameOrDefault(fileName, mediaType),
+				MIMEType: mediaType,
+				Data:     data,
+			}, nil
+		}
 	}
-	if part.Body.AttachmentId != "" {
-		return fetch(messageID, part.Body.AttachmentId)
-	}
-	if part.Body.Data == "" {
-		return nil, nil
-	}
-
-	decoded, err := base64.URLEncoding.DecodeString(part.Body.Data)
-	if err == nil {
-		return decoded, nil
-	}
-
-	return base64.RawURLEncoding.DecodeString(part.Body.Data)
+	return "", nil, nil
 }
 
 func filenameOrDefault(name, mimeType string) string {

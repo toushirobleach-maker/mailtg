@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"mailtg/internal/config"
-	"mailtg/internal/gmailclient"
+	"mailtg/internal/imapclient"
 	"mailtg/internal/state"
 	"mailtg/internal/tgsender"
 )
@@ -38,12 +38,9 @@ func main() {
 		log.Fatalf("init telegram sender: %v", err)
 	}
 
-	gmailSvc, err := gmailclient.New(ctx, cfg, store)
-	if err != nil {
-		log.Fatalf("init gmail client: %v", err)
-	}
+	mailSvc := imapclient.New(cfg)
 
-	ignoredAtStartup, err := snapshotUnreadIDs(ctx, gmailSvc)
+	ignoredAtStartup, err := snapshotUnreadIDs(ctx, mailSvc)
 	if err != nil {
 		log.Fatalf("snapshot startup unread messages: %v", err)
 	}
@@ -53,7 +50,7 @@ func main() {
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 
-	if err := processOnce(ctx, gmailSvc, sender, store, ignoredAtStartup); err != nil {
+	if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup); err != nil {
 		log.Printf("initial poll failed: %v", err)
 	}
 
@@ -63,7 +60,7 @@ func main() {
 			log.Println("shutting down")
 			return
 		case <-ticker.C:
-			if err := processOnce(ctx, gmailSvc, sender, store, ignoredAtStartup); err != nil && !errors.Is(err, context.Canceled) {
+			if err := processOnce(ctx, mailSvc, sender, store, ignoredAtStartup); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("poll failed: %v", err)
 			}
 		}
@@ -72,12 +69,12 @@ func main() {
 
 func processOnce(
 	ctx context.Context,
-	gm *gmailclient.Client,
+	mailSvc *imapclient.Client,
 	sender *tgsender.Sender,
 	store *state.Store,
 	ignoredAtStartup map[string]struct{},
 ) error {
-	messages, err := gm.ListUnread(ctx)
+	messages, err := mailSvc.ListUnread(ctx)
 	if err != nil {
 		return err
 	}
@@ -89,32 +86,32 @@ func processOnce(
 		default:
 		}
 
-		if _, ignored := ignoredAtStartup[msg.Id]; ignored {
+		if _, ignored := ignoredAtStartup[msg.ID]; ignored {
 			continue
 		}
 
-		if store.IsFailed(ctx, msg.Id, maxFailures) {
-			if err := gm.MarkFailed(ctx, msg.Id); err != nil {
-				log.Printf("mark previously failed message %s: %v", msg.Id, err)
+		if store.IsFailed(ctx, msg.ID, maxFailures) {
+			if err := mailSvc.MarkFailed(ctx, msg.ID); err != nil {
+				log.Printf("mark previously failed message %s: %v", msg.ID, err)
 			}
 			continue
 		}
 
-		if store.IsProcessed(ctx, msg.Id) {
-			if err := gm.MarkRead(ctx, msg.Id); err != nil {
-				log.Printf("mark read skipped message %s: %v", msg.Id, err)
+		if store.IsProcessed(ctx, msg.ID) {
+			if err := mailSvc.MarkRead(ctx, msg.ID); err != nil {
+				log.Printf("mark read skipped message %s: %v", msg.ID, err)
 			}
 			continue
 		}
 
-		parsed, err := gm.GetParsedMessage(ctx, msg.Id)
+		parsed, err := mailSvc.GetParsedMessage(ctx, msg.ID)
 		if err != nil {
-			recordFailure(ctx, gm, store, msg.Id, err)
+			recordFailure(ctx, mailSvc, store, msg.ID, err)
 			continue
 		}
 		log.Printf(
-			"received gmail message %s to %s -> chat_id=%d thread_id=%d has_photo=%t text=%q",
-			msg.Id,
+			"received mail message %s to %s -> chat_id=%d thread_id=%d has_photo=%t text=%q",
+			msg.ID,
 			parsed.Recipient,
 			parsed.ChatID,
 			parsed.ThreadID,
@@ -124,32 +121,32 @@ func processOnce(
 
 		result, err := sender.Deliver(parsed)
 		if err != nil {
-			recordFailure(ctx, gm, store, msg.Id, err)
+			recordFailure(ctx, mailSvc, store, msg.ID, err)
 			continue
 		}
 		log.Printf(
-			"telegram delivery ok for gmail message %s: mode=%s chat_id=%d thread_id=%d",
-			msg.Id,
+			"telegram delivery ok for mail message %s: mode=%s chat_id=%d thread_id=%d",
+			msg.ID,
 			result.Mode,
 			parsed.ChatID,
 			parsed.ThreadID,
 		)
 
-		if err := store.ClearFailure(ctx, msg.Id); err != nil {
-			log.Printf("clear failures %s: %v", msg.Id, err)
+		if err := store.ClearFailure(ctx, msg.ID); err != nil {
+			log.Printf("clear failures %s: %v", msg.ID, err)
 		}
-		if err := store.MarkProcessed(ctx, msg.Id); err != nil {
-			log.Printf("persist processed %s: %v", msg.Id, err)
+		if err := store.MarkProcessed(ctx, msg.ID); err != nil {
+			log.Printf("persist processed %s: %v", msg.ID, err)
 		}
-		if err := gm.MarkRead(ctx, msg.Id); err != nil {
-			log.Printf("mark read %s: %v", msg.Id, err)
+		if err := mailSvc.MarkRead(ctx, msg.ID); err != nil {
+			log.Printf("mark read %s: %v", msg.ID, err)
 		}
 	}
 
 	return nil
 }
 
-func recordFailure(ctx context.Context, gm *gmailclient.Client, store *state.Store, messageID string, reason error) {
+func recordFailure(ctx context.Context, mailSvc *imapclient.Client, store *state.Store, messageID string, reason error) {
 	count, err := store.RecordFailure(ctx, messageID, reason.Error())
 	if err != nil {
 		log.Printf("record failure %s: %v", messageID, err)
@@ -161,7 +158,7 @@ func recordFailure(ctx context.Context, gm *gmailclient.Client, store *state.Sto
 		return
 	}
 
-	if err := gm.MarkFailed(ctx, messageID); err != nil {
+	if err := mailSvc.MarkFailed(ctx, messageID); err != nil {
 		log.Printf("mark failed message %s: %v", messageID, err)
 		return
 	}
@@ -169,7 +166,7 @@ func recordFailure(ctx context.Context, gm *gmailclient.Client, store *state.Sto
 	if _, lastError, ok, detailErr := store.FailureDetails(ctx, messageID); detailErr != nil {
 		log.Printf("load failure details %s: %v", messageID, detailErr)
 	} else if ok {
-		log.Printf("message %s moved to Gmail label mailtg_failed after %d failures; last error: %s", messageID, count, lastError)
+		log.Printf("message %s marked as seen after %d failures; last error: %s", messageID, count, lastError)
 	}
 }
 
@@ -179,15 +176,15 @@ func singleLine(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
-func snapshotUnreadIDs(ctx context.Context, gm *gmailclient.Client) (map[string]struct{}, error) {
-	messages, err := gm.ListUnread(ctx)
+func snapshotUnreadIDs(ctx context.Context, mailSvc *imapclient.Client) (map[string]struct{}, error) {
+	messages, err := mailSvc.ListUnread(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	ignored := make(map[string]struct{}, len(messages))
 	for _, msg := range messages {
-		ignored[msg.Id] = struct{}{}
+		ignored[msg.ID] = struct{}{}
 	}
 	return ignored, nil
 }

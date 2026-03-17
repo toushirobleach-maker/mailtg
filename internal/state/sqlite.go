@@ -44,12 +44,6 @@ CREATE TABLE IF NOT EXISTS message_failures (
 	last_error TEXT NOT NULL DEFAULT '',
 	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TABLE IF NOT EXISTS oauth_tokens (
-	provider TEXT PRIMARY KEY,
-	token_json TEXT NOT NULL,
-	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 `
 	_, err := s.db.Exec(query)
 	return err
@@ -143,41 +137,6 @@ func (s *Store) ClearFailure(ctx context.Context, messageID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM message_failures WHERE message_id = ?`, messageID)
 	if err != nil {
 		return fmt.Errorf("clear failure: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) ReadOAuthToken(ctx context.Context, provider string) (string, bool, error) {
-	var tokenJSON string
-	err := s.db.QueryRowContext(
-		ctx,
-		`SELECT token_json FROM oauth_tokens WHERE provider = ?`,
-		provider,
-	).Scan(&tokenJSON)
-	if err == sql.ErrNoRows {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("read oauth token: %w", err)
-	}
-	return tokenJSON, true, nil
-}
-
-func (s *Store) SaveOAuthToken(ctx context.Context, provider, tokenJSON string) error {
-	_, err := s.db.ExecContext(
-		ctx,
-		`
-INSERT INTO oauth_tokens(provider, token_json)
-VALUES (?, ?)
-ON CONFLICT(provider) DO UPDATE SET
-	token_json = excluded.token_json,
-	updated_at = CURRENT_TIMESTAMP
-`,
-		provider,
-		tokenJSON,
-	)
-	if err != nil {
-		return fmt.Errorf("save oauth token: %w", err)
 	}
 	return nil
 }
